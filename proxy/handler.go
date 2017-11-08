@@ -9,6 +9,7 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/transport"
 )
 
@@ -24,7 +25,7 @@ var (
 //
 // This can *only* be used if the `server` also uses grpcproxy.CodecForServer() ServerOption.
 func RegisterService(server *grpc.Server, director StreamDirector, serviceName string, methodNames ...string) {
-	streamer := &handler{director}
+	streamer := &handler{director, make(map[string]bool)}
 	fakeDesc := &grpc.ServiceDesc{
 		ServiceName: serviceName,
 		HandlerType: (*interface{})(nil),
@@ -46,13 +47,17 @@ func RegisterService(server *grpc.Server, director StreamDirector, serviceName s
 // backends. It should be used as a `grpc.UnknownServiceHandler`.
 //
 // This can *only* be used if the `server` also uses grpcproxy.CodecForServer() ServerOption.
-func TransparentHandler(director StreamDirector) grpc.StreamHandler {
-	streamer := &handler{director}
+func TransparentHandler(director StreamDirector, keys ... string) grpc.StreamHandler {
+	streamer := &handler{director, make(map[string]bool)}
+	for _,key := range keys {
+		streamer.metadatakeys[key] = true
+	}
 	return streamer.handler
 }
 
 type handler struct {
 	director StreamDirector
+	metadatakeys map[string]bool //whitelist of metadatakeys
 }
 
 // handler is where the real magic of proxying happens.
@@ -71,6 +76,21 @@ func (s *handler) handler(srv interface{}, serverStream grpc.ServerStream) error
 		return err
 	}
 	// TODO(mwitkow): Add a `forwarded` header to metadata, https://en.wikipedia.org/wiki/X-Forwarded-For.
+	md := metadata.Pairs()
+	forward, ok  := metadata.FromIncomingContext(clientCtx)
+	if ok {
+
+		for k, v := range forward {
+			if _, found := s.metadatakeys[k]; found {
+				md = metadata.Join(md, metadata.Pairs(k, v[0]))
+			}
+		}
+
+		if ( len(md) > 0 ) {
+			clientCtx = metadata.NewOutgoingContext(clientCtx, md)
+		}
+	}
+
 	clientStream, err := grpc.NewClientStream(clientCtx, clientStreamDescForProxying, backendConn, fullMethodName)
 	if err != nil {
 		return err
